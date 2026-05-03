@@ -310,14 +310,24 @@ func openAIPromptCacheRetentionFromClaude(cacheControl []byte) []byte {
 	if len(cacheControl) == 0 {
 		return nil
 	}
+	var parsed map[string]any
+	if err := common.Unmarshal(cacheControl, &parsed); err == nil {
+		// OpenAI Responses exposes Anthropic's 1h ephemeral cache tier as 24h retention.
+		if common.Interface2String(parsed["ttl"]) == "1h" {
+			return []byte(`"24h"`)
+		}
+	}
 	return []byte(`"in_memory"`)
 }
 
 func applyClaudeCacheControlToOpenAIRequest(openAIRequest *dto.GeneralOpenAIRequest, cacheControl []byte) {
-	if openAIRequest == nil || len(cacheControl) == 0 || len(openAIRequest.PromptCacheRetention) > 0 {
+	if openAIRequest == nil || len(cacheControl) == 0 || string(openAIRequest.PromptCacheRetention) == `"24h"` {
 		return
 	}
-	openAIRequest.PromptCacheRetention = openAIPromptCacheRetentionFromClaude(cacheControl)
+	retention := openAIPromptCacheRetentionFromClaude(cacheControl)
+	if len(openAIRequest.PromptCacheRetention) == 0 || string(retention) == `"24h"` {
+		openAIRequest.PromptCacheRetention = retention
+	}
 }
 
 func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.RelayInfo) (*dto.GeneralOpenAIRequest, error) {
@@ -424,7 +434,6 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 				openAIMessage := dto.Message{
 					Role: "system",
 				}
-				isOpenRouterClaude := isOpenRouter && strings.HasPrefix(info.UpstreamModelName, "anthropic/claude")
 				if isOpenRouterClaude {
 					systemMediaMessages := make([]dto.MediaContent, 0, len(systems))
 					for _, system := range systems {
@@ -471,8 +480,8 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 				switch mediaMsg.Type {
 				case "text", "input_text":
 					message := dto.MediaContent{
-						Type:         "text",
-						Text:         mediaMsg.GetText(),
+						Type: "text",
+						Text: mediaMsg.GetText(),
 					}
 					if isOpenRouterClaude {
 						message.CacheControl = mediaMsg.CacheControl

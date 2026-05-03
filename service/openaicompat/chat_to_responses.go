@@ -314,43 +314,43 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 		contentParts := make([]map[string]any, 0, len(parts))
 		for _, part := range parts {
 			switch part.Type {
-		case dto.ContentTypeText:
-			textType := "input_text"
-			if role == "assistant" {
-				textType = "output_text"
+			case dto.ContentTypeText:
+				textType := "input_text"
+				if role == "assistant" {
+					textType = "output_text"
+				}
+				contentParts = append(contentParts, map[string]any{
+					"type": textType,
+					"text": part.Text,
+				})
+				if len(part.CacheControl) > 0 {
+					inputCacheRetention = mergePromptCacheRetention(inputCacheRetention, promptCacheRetentionFromRawCacheControl(part.CacheControl))
+				}
+			case dto.ContentTypeImageURL:
+				contentParts = append(contentParts, map[string]any{
+					"type":      "input_image",
+					"image_url": normalizeChatImageURLToString(part.ImageUrl),
+				})
+			case dto.ContentTypeInputAudio:
+				contentParts = append(contentParts, map[string]any{
+					"type":        "input_audio",
+					"input_audio": part.InputAudio,
+				})
+			case dto.ContentTypeFile:
+				contentParts = append(contentParts, map[string]any{
+					"type": "input_file",
+					"file": part.File,
+				})
+			case dto.ContentTypeVideoUrl:
+				contentParts = append(contentParts, map[string]any{
+					"type":      "input_video",
+					"video_url": part.VideoUrl,
+				})
+			default:
+				contentParts = append(contentParts, map[string]any{
+					"type": part.Type,
+				})
 			}
-			contentParts = append(contentParts, map[string]any{
-				"type": textType,
-				"text": part.Text,
-			})
-			if len(part.CacheControl) > 0 {
-				inputCacheRetention = mergePromptCacheRetention(inputCacheRetention, promptCacheRetentionFromRawCacheControl(part.CacheControl))
-			}
-		case dto.ContentTypeImageURL:
-			contentParts = append(contentParts, map[string]any{
-				"type":      "input_image",
-				"image_url": normalizeChatImageURLToString(part.ImageUrl),
-			})
-		case dto.ContentTypeInputAudio:
-			contentParts = append(contentParts, map[string]any{
-				"type":        "input_audio",
-				"input_audio": part.InputAudio,
-			})
-		case dto.ContentTypeFile:
-			contentParts = append(contentParts, map[string]any{
-				"type": "input_file",
-				"file": part.File,
-			})
-		case dto.ContentTypeVideoUrl:
-			contentParts = append(contentParts, map[string]any{
-				"type":      "input_video",
-				"video_url": part.VideoUrl,
-			})
-		default:
-			contentParts = append(contentParts, map[string]any{
-				"type": part.Type,
-			})
-		}
 		}
 		item["content"] = contentParts
 		inputItems = append(inputItems, item)

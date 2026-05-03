@@ -144,6 +144,62 @@ func TestClaudeToOpenAIRequestMapsCacheControlToPromptCacheRetention(t *testing.
 	require.Empty(t, openAIRequest.Messages[0].ParseContent()[0].CacheControl)
 }
 
+func TestClaudeToOpenAIRequestMapsOneHourCacheControlToPromptCacheRetention(t *testing.T) {
+	request := dto.ClaudeRequest{
+		Model:        "claude-3-5-sonnet",
+		CacheControl: []byte(`{"type":"ephemeral","ttl":"1h"}`),
+		Messages: []dto.ClaudeMessage{{
+			Role:    "user",
+			Content: "hello",
+		}},
+	}
+
+	openAIRequest, err := ClaudeToOpenAIRequest(request, &relaycommon.RelayInfo{})
+
+	require.NoError(t, err)
+	require.Equal(t, `"24h"`, string(openAIRequest.PromptCacheRetention))
+}
+
+func TestClaudeToOpenAIRequestKeepsLongestCacheRetention(t *testing.T) {
+	request := dto.ClaudeRequest{
+		Model:        "claude-3-5-sonnet",
+		CacheControl: []byte(`{"type":"ephemeral"}`),
+		System: []any{map[string]any{
+			"type":          "text",
+			"text":          "system",
+			"cache_control": map[string]any{"type": "ephemeral", "ttl": "1h"},
+		}},
+		Messages: []dto.ClaudeMessage{{
+			Role:    "user",
+			Content: "hello",
+		}},
+	}
+
+	openAIRequest, err := ClaudeToOpenAIRequest(request, &relaycommon.RelayInfo{})
+
+	require.NoError(t, err)
+	require.Equal(t, `"24h"`, string(openAIRequest.PromptCacheRetention))
+}
+
+func TestClaudeToOpenAIRequestHandlesNilRelayInfoWithStructuredSystem(t *testing.T) {
+	request := dto.ClaudeRequest{
+		Model: "claude-3-5-sonnet",
+		System: []any{map[string]any{
+			"type": "text",
+			"text": "system",
+		}},
+		Messages: []dto.ClaudeMessage{{
+			Role:    "user",
+			Content: "hello",
+		}},
+	}
+
+	openAIRequest, err := ClaudeToOpenAIRequest(request, nil)
+
+	require.NoError(t, err)
+	require.Len(t, openAIRequest.Messages, 2)
+}
+
 func TestStreamResponseOpenAI2ClaudeSanitizesEmptyOptionalToolArgs(t *testing.T) {
 	info := newClaudeConvertTestInfo()
 	info.Request = &dto.ClaudeRequest{
