@@ -1,7 +1,6 @@
 package service
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -13,6 +12,313 @@ import (
 	"github.com/QuantumNous/new-api/relay/reasonmap"
 	"github.com/samber/lo"
 )
+
+type claudeContentSegment struct {
+	kind string
+	text string
+}
+
+const (
+	thinkOpenTag  = "<think>"
+	thinkCloseTag = "</think>"
+)
+
+func appendClaudeContentSegment(segments *[]claudeContentSegment, kind string, text string) {
+	if text == "" {
+		return
+	}
+	last := len(*segments) - 1
+	if last >= 0 && (*segments)[last].kind == kind {
+		(*segments)[last].text += text
+		return
+	}
+	*segments = append(*segments, claudeContentSegment{kind: kind, text: text})
+}
+
+func splitThinkTaggedContent(content string) []claudeContentSegment {
+	if content == "" {
+		return nil
+	}
+
+	trimmed := strings.TrimLeft(content, " \t\r\n")
+	if !strings.HasPrefix(trimmed, thinkOpenTag) {
+		return []claudeContentSegment{{kind: relaycommon.LastMessageTypeText, text: content}}
+	}
+
+	segments := make([]claudeContentSegment, 0)
+	leading := len(content) - len(trimmed)
+	start := leading + len(thinkOpenTag)
+	closeOffset := strings.Index(content[start:], thinkCloseTag)
+	if closeOffset == -1 {
+		appendClaudeContentSegment(&segments, relaycommon.LastMessageTypeThinking, strings.TrimSpace(content[start:]))
+		return segments
+	}
+
+	close := start + closeOffset
+	appendClaudeContentSegment(&segments, relaycommon.LastMessageTypeThinking, strings.TrimSpace(content[start:close]))
+	appendClaudeContentSegment(&segments, relaycommon.LastMessageTypeText, content[close+len(thinkCloseTag):])
+	return segments
+}
+
+func longestSuffixPrefix(s string, prefix string) int {
+	maxLen := len(prefix) - 1
+	if len(s) < maxLen {
+		maxLen = len(s)
+	}
+	for i := maxLen; i > 0; i-- {
+		if strings.HasSuffix(s, prefix[:i]) {
+			return i
+		}
+	}
+	return 0
+}
+
+func splitThinkTaggedStreamContent(content string, state *relaycommon.ClaudeConvertInfo) []claudeContentSegment {
+	if state == nil {
+		return splitThinkTaggedContent(content)
+	}
+
+	data := state.ThinkTagBuffer + content
+	state.ThinkTagBuffer = ""
+	segments := make([]claudeContentSegment, 0)
+
+	if state.InThinkTag {
+		close := strings.Index(data, thinkCloseTag)
+		if close == -1 {
+			keep := longestSuffixPrefix(data, thinkCloseTag)
+			appendClaudeContentSegment(&segments, relaycommon.LastMessageTypeThinking, data[:len(data)-keep])
+			state.ThinkTagBuffer = data[len(data)-keep:]
+			return segments
+		}
+		appendClaudeContentSegment(&segments, relaycommon.LastMessageTypeThinking, data[:close])
+		appendClaudeContentSegment(&segments, relaycommon.LastMessageTypeText, data[close+len(thinkCloseTag):])
+		state.InThinkTag = false
+		return segments
+	}
+
+	if state.LastMessagesType != relaycommon.LastMessageTypeNone {
+		appendClaudeContentSegment(&segments, relaycommon.LastMessageTypeText, data)
+		return segments
+	}
+
+	trimmed := strings.TrimLeft(data, " \t\r\n")
+	if trimmed == "" {
+		state.ThinkTagBuffer = data
+		return nil
+	}
+	if strings.HasPrefix(thinkOpenTag, trimmed) {
+		state.ThinkTagBuffer = data
+		return nil
+	}
+	if !strings.HasPrefix(trimmed, thinkOpenTag) {
+		appendClaudeContentSegment(&segments, relaycommon.LastMessageTypeText, data)
+		return segments
+	}
+
+	start := len(data) - len(trimmed) + len(thinkOpenTag)
+	close := strings.Index(data[start:], thinkCloseTag)
+	if close == -1 {
+		state.InThinkTag = true
+		keep := longestSuffixPrefix(data[start:], thinkCloseTag)
+		appendClaudeContentSegment(&segments, relaycommon.LastMessageTypeThinking, data[start:len(data)-keep])
+		state.ThinkTagBuffer = data[len(data)-keep:]
+		return segments
+	}
+
+	close += start
+	appendClaudeContentSegment(&segments, relaycommon.LastMessageTypeThinking, data[start:close])
+	appendClaudeContentSegment(&segments, relaycommon.LastMessageTypeText, data[close+len(thinkCloseTag):])
+	return segments
+}
+
+func flushThinkTagBuffer(state *relaycommon.ClaudeConvertInfo) []claudeContentSegment {
+	if state == nil || state.ThinkTagBuffer == "" {
+		return nil
+	}
+	kind := relaycommon.LastMessageTypeText
+	if state.InThinkTag {
+		kind = relaycommon.LastMessageTypeThinking
+	}
+	segment := claudeContentSegment{kind: kind, text: state.ThinkTagBuffer}
+	state.ThinkTagBuffer = ""
+	return []claudeContentSegment{segment}
+}
+
+func parseClaudeTool(raw any) (*dto.Tool, bool) {
+	switch tool := raw.(type) {
+	case dto.Tool:
+		return &tool, true
+	case *dto.Tool:
+		return tool, tool != nil
+	case map[string]any:
+		name := common.Interface2String(tool["name"])
+		if name == "" {
+			return nil, false
+		}
+		parsed := &dto.Tool{
+			Name:        name,
+			Description: common.Interface2String(tool["description"]),
+		}
+		if schema, err := common.Any2Type[map[string]any](tool["input_schema"]); err == nil {
+			parsed.InputSchema = schema
+		}
+		return parsed, true
+	default:
+		parsed, err := common.Any2Type[dto.Tool](raw)
+		if err != nil || parsed.Name == "" {
+			return nil, false
+		}
+		return &parsed, true
+	}
+}
+
+func findClaudeToolInputSchema(info *relaycommon.RelayInfo, toolName string) map[string]any {
+	if info == nil || toolName == "" {
+		return nil
+	}
+	claudeRequest, ok := info.Request.(*dto.ClaudeRequest)
+	if !ok || claudeRequest == nil || claudeRequest.Tools == nil {
+		return nil
+	}
+
+	matchTool := func(tool *dto.Tool) map[string]any {
+		if tool == nil || tool.Name != toolName || tool.InputSchema == nil {
+			return nil
+		}
+		return tool.InputSchema
+	}
+
+	switch tools := claudeRequest.Tools.(type) {
+	case []dto.Tool:
+		for i := range tools {
+			if schema := matchTool(&tools[i]); schema != nil {
+				return schema
+			}
+		}
+	case []*dto.Tool:
+		for _, tool := range tools {
+			if schema := matchTool(tool); schema != nil {
+				return schema
+			}
+		}
+	case []any:
+		for _, raw := range tools {
+			if tool, ok := parseClaudeTool(raw); ok {
+				if schema := matchTool(tool); schema != nil {
+					return schema
+				}
+			}
+		}
+	default:
+		parsedTools, err := common.Any2Type[[]dto.Tool](claudeRequest.Tools)
+		if err != nil {
+			return nil
+		}
+		for i := range parsedTools {
+			if schema := matchTool(&parsedTools[i]); schema != nil {
+				return schema
+			}
+		}
+	}
+	return nil
+}
+
+func claudeToolRequiredSet(schema map[string]any) map[string]bool {
+	required := make(map[string]bool)
+	switch values := schema["required"].(type) {
+	case []string:
+		for _, value := range values {
+			required[value] = true
+		}
+	case []any:
+		for _, value := range values {
+			if s, ok := value.(string); ok {
+				required[s] = true
+			}
+		}
+	}
+	return required
+}
+
+func claudeToolPropertiesSet(schema map[string]any) map[string]bool {
+	props, err := common.Any2Type[map[string]any](schema["properties"])
+	if err != nil {
+		return nil
+	}
+	properties := make(map[string]bool, len(props))
+	for key := range props {
+		properties[key] = true
+	}
+	return properties
+}
+
+func sanitizeClaudeToolInput(input map[string]any, toolName string, info *relaycommon.RelayInfo) (map[string]any, bool) {
+	if len(input) == 0 {
+		return input, false
+	}
+	schema := findClaudeToolInputSchema(info, toolName)
+	if schema == nil {
+		return input, false
+	}
+	properties := claudeToolPropertiesSet(schema)
+	if len(properties) == 0 {
+		return input, false
+	}
+	required := claudeToolRequiredSet(schema)
+
+	var sanitized map[string]any
+	for key, value := range input {
+		if required[key] || !properties[key] {
+			continue
+		}
+		if s, ok := value.(string); ok && s == "" {
+			if sanitized == nil {
+				sanitized = make(map[string]any, len(input))
+				for copyKey, copyValue := range input {
+					sanitized[copyKey] = copyValue
+				}
+			}
+			delete(sanitized, key)
+		}
+	}
+	if sanitized == nil {
+		return input, false
+	}
+	return sanitized, true
+}
+
+func sanitizeClaudeToolArguments(arguments string, toolName string, info *relaycommon.RelayInfo) string {
+	if strings.TrimSpace(arguments) == "" {
+		return arguments
+	}
+	var input map[string]any
+	if err := common.Unmarshal([]byte(arguments), &input); err != nil {
+		return arguments
+	}
+	sanitized, changed := sanitizeClaudeToolInput(input, toolName, info)
+	if !changed {
+		return arguments
+	}
+	encoded, err := common.Marshal(sanitized)
+	if err != nil {
+		return arguments
+	}
+	return string(encoded)
+}
+
+func openAIPromptCacheRetentionFromClaude(cacheControl []byte) []byte {
+	if len(cacheControl) == 0 {
+		return nil
+	}
+	return []byte(`"in_memory"`)
+}
+
+func applyClaudeCacheControlToOpenAIRequest(openAIRequest *dto.GeneralOpenAIRequest, cacheControl []byte) {
+	if openAIRequest == nil || len(cacheControl) == 0 || len(openAIRequest.PromptCacheRetention) > 0 {
+		return
+	}
+	openAIRequest.PromptCacheRetention = openAIPromptCacheRetentionFromClaude(cacheControl)
+}
 
 func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.RelayInfo) (*dto.GeneralOpenAIRequest, error) {
 	openAIRequest := dto.GeneralOpenAIRequest{
@@ -32,11 +338,24 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 		openAIRequest.Stream = lo.ToPtr(lo.FromPtr(claudeRequest.Stream))
 	}
 
-	isOpenRouter := info.ChannelType == constant.ChannelTypeOpenRouter
+	channelType := 0
+	upstreamModelName := ""
+	originModelName := ""
+	if info != nil && info.ChannelMeta != nil {
+		channelType = info.ChannelType
+		upstreamModelName = info.UpstreamModelName
+		originModelName = info.OriginModelName
+	}
+
+	isOpenRouter := channelType == constant.ChannelTypeOpenRouter
+	isOpenRouterClaude := isOpenRouter && strings.HasPrefix(upstreamModelName, "anthropic/claude")
+	if !isOpenRouterClaude {
+		applyClaudeCacheControlToOpenAIRequest(&openAIRequest, claudeRequest.CacheControl)
+	}
 
 	if isOpenRouter {
 		if effort := claudeRequest.GetEfforts(); effort != "" {
-			effortBytes, _ := json.Marshal(effort)
+			effortBytes, _ := common.Marshal(effort)
 			openAIRequest.Verbosity = effortBytes
 		}
 		if claudeRequest.Thinking != nil {
@@ -51,7 +370,7 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 					Enabled: true,
 				}
 			}
-			reasoningJSON, err := json.Marshal(reasoning)
+			reasoningJSON, err := common.Marshal(reasoning)
 			if err != nil {
 				return nil, fmt.Errorf("failed to marshal reasoning: %w", err)
 			}
@@ -59,7 +378,7 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 		}
 	} else {
 		thinkingSuffix := "-thinking"
-		if strings.HasSuffix(info.OriginModelName, thinkingSuffix) &&
+		if strings.HasSuffix(originModelName, thinkingSuffix) &&
 			!strings.HasSuffix(openAIRequest.Model, thinkingSuffix) {
 			openAIRequest.Model = openAIRequest.Model + thinkingSuffix
 		}
@@ -120,6 +439,7 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 				} else {
 					systemStr := ""
 					for _, system := range systems {
+						applyClaudeCacheControlToOpenAIRequest(&openAIRequest, system.CacheControl)
 						if system.Text != nil {
 							systemStr += *system.Text
 						}
@@ -153,7 +473,11 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 					message := dto.MediaContent{
 						Type:         "text",
 						Text:         mediaMsg.GetText(),
-						CacheControl: mediaMsg.CacheControl,
+					}
+					if isOpenRouterClaude {
+						message.CacheControl = mediaMsg.CacheControl
+					} else {
+						applyClaudeCacheControlToOpenAIRequest(&openAIRequest, mediaMsg.CacheControl)
 					}
 					mediaMessages = append(mediaMessages, message)
 				case "image":
@@ -258,29 +582,70 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 	}
 
 	var claudeResponses []*dto.ClaudeResponse
-	// stopOpenBlocks emits the required content_block_stop event(s) for the currently open block(s)
-	// according to Anthropic's SSE streaming state machine:
-	// content_block_start -> content_block_delta* -> content_block_stop (per index).
-	//
-	// For text/thinking, there is at most one open block at info.ClaudeConvertInfo.Index.
-	// For tools, OpenAI tool_calls can stream multiple parallel tool_use blocks (indexed from 0),
-	// so we may have multiple open blocks and must stop each one explicitly.
+
+	ensureToolCallBuffers := func() {
+		if info.ClaudeConvertInfo.ToolCallArgumentBuffers == nil {
+			info.ClaudeConvertInfo.ToolCallArgumentBuffers = make(map[int]string)
+		}
+		if info.ClaudeConvertInfo.ToolCallNames == nil {
+			info.ClaudeConvertInfo.ToolCallNames = make(map[int]string)
+		}
+	}
+	setToolCallName := func(blockIndex int, name string) {
+		if name == "" {
+			return
+		}
+		ensureToolCallBuffers()
+		info.ClaudeConvertInfo.ToolCallNames[blockIndex] = name
+	}
+	appendToolCallArguments := func(blockIndex int, arguments string) {
+		if arguments == "" {
+			return
+		}
+		ensureToolCallBuffers()
+		info.ClaudeConvertInfo.ToolCallArgumentBuffers[blockIndex] += arguments
+	}
+	flushToolCallArguments := func() {
+		if len(info.ClaudeConvertInfo.ToolCallArgumentBuffers) == 0 {
+			return
+		}
+		base := info.ClaudeConvertInfo.ToolCallBaseIndex
+		for offset := 0; offset <= info.ClaudeConvertInfo.ToolCallMaxIndexOffset; offset++ {
+			blockIndex := base + offset
+			arguments := info.ClaudeConvertInfo.ToolCallArgumentBuffers[blockIndex]
+			if arguments == "" {
+				continue
+			}
+			arguments = sanitizeClaudeToolArguments(arguments, info.ClaudeConvertInfo.ToolCallNames[blockIndex], info)
+			idx := blockIndex
+			claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+				Index: &idx,
+				Type:  "content_block_delta",
+				Delta: &dto.ClaudeMediaMessage{
+					Type:        "input_json_delta",
+					PartialJson: &arguments,
+				},
+			})
+		}
+		info.ClaudeConvertInfo.ToolCallArgumentBuffers = nil
+		info.ClaudeConvertInfo.ToolCallNames = nil
+	}
+
+	var appendContentSegments func([]claudeContentSegment)
+
 	stopOpenBlocks := func() {
 		switch info.ClaudeConvertInfo.LastMessagesType {
 		case relaycommon.LastMessageTypeText, relaycommon.LastMessageTypeThinking:
+			appendContentSegments(flushThinkTagBuffer(info.ClaudeConvertInfo))
 			claudeResponses = append(claudeResponses, generateStopBlock(info.ClaudeConvertInfo.Index))
 		case relaycommon.LastMessageTypeTools:
+			flushToolCallArguments()
 			base := info.ClaudeConvertInfo.ToolCallBaseIndex
 			for offset := 0; offset <= info.ClaudeConvertInfo.ToolCallMaxIndexOffset; offset++ {
 				claudeResponses = append(claudeResponses, generateStopBlock(base+offset))
 			}
 		}
 	}
-	// stopOpenBlocksAndAdvance closes the currently open block(s) and advances the content block index
-	// to the next available slot for subsequent content_block_start events.
-	//
-	// This prevents invalid streams where a content_block_delta (e.g. thinking_delta) is emitted for an
-	// index whose active content_block type is different (the typical cause of "Mismatched content block type").
 	stopOpenBlocksAndAdvance := func() {
 		if info.ClaudeConvertInfo.LastMessagesType == relaycommon.LastMessageTypeNone {
 			return
@@ -295,6 +660,66 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 			info.ClaudeConvertInfo.Index++
 		}
 		info.ClaudeConvertInfo.LastMessagesType = relaycommon.LastMessageTypeNone
+	}
+	appendContentSegment := func(segment claudeContentSegment) {
+		if segment.text == "" {
+			return
+		}
+		switch segment.kind {
+		case relaycommon.LastMessageTypeThinking:
+			if info.ClaudeConvertInfo.LastMessagesType != relaycommon.LastMessageTypeThinking {
+				stopOpenBlocksAndAdvance()
+				idx := info.ClaudeConvertInfo.Index
+				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+					Index: &idx,
+					Type:  "content_block_start",
+					ContentBlock: &dto.ClaudeMediaMessage{
+						Type:     "thinking",
+						Thinking: common.GetPointer[string](""),
+					},
+				})
+			}
+			info.ClaudeConvertInfo.LastMessagesType = relaycommon.LastMessageTypeThinking
+			idx := info.ClaudeConvertInfo.Index
+			thinking := segment.text
+			claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+				Index: &idx,
+				Type:  "content_block_delta",
+				Delta: &dto.ClaudeMediaMessage{
+					Type:     "thinking_delta",
+					Thinking: &thinking,
+				},
+			})
+		default:
+			if info.ClaudeConvertInfo.LastMessagesType != relaycommon.LastMessageTypeText {
+				stopOpenBlocksAndAdvance()
+				idx := info.ClaudeConvertInfo.Index
+				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+					Index: &idx,
+					Type:  "content_block_start",
+					ContentBlock: &dto.ClaudeMediaMessage{
+						Type: "text",
+						Text: common.GetPointer[string](""),
+					},
+				})
+			}
+			info.ClaudeConvertInfo.LastMessagesType = relaycommon.LastMessageTypeText
+			idx := info.ClaudeConvertInfo.Index
+			text := segment.text
+			claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+				Index: &idx,
+				Type:  "content_block_delta",
+				Delta: &dto.ClaudeMediaMessage{
+					Type: "text_delta",
+					Text: &text,
+				},
+			})
+		}
+	}
+	appendContentSegments = func(segments []claudeContentSegment) {
+		for _, segment := range segments {
+			appendContentSegment(segment)
+		}
 	}
 	if info.SendResponseCount == 1 {
 		msg := &dto.ClaudeMediaMessage{
@@ -340,19 +765,9 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 				},
 			}
 			resp.SetIndex(0)
+			setToolCallName(0, toolCall.Function.Name)
 			claudeResponses = append(claudeResponses, resp)
-			// 首块包含工具 delta，则追加 input_json_delta
-			if toolCall.Function.Arguments != "" {
-				idx := 0
-				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-					Index: &idx,
-					Type:  "content_block_delta",
-					Delta: &dto.ClaudeMediaMessage{
-						Type:        "input_json_delta",
-						PartialJson: &toolCall.Function.Arguments,
-					},
-				})
-			}
+			appendToolCallArguments(0, toolCall.Function.Arguments)
 		} else {
 
 		}
@@ -362,51 +777,9 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 			content := openAIResponse.Choices[0].Delta.GetContentString()
 
 			if reasoning != "" {
-				if info.ClaudeConvertInfo.LastMessagesType != relaycommon.LastMessageTypeThinking {
-					stopOpenBlocksAndAdvance()
-				}
-				idx := info.ClaudeConvertInfo.Index
-				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-					Index: &idx,
-					Type:  "content_block_start",
-					ContentBlock: &dto.ClaudeMediaMessage{
-						Type:     "thinking",
-						Thinking: common.GetPointer[string](""),
-					},
-				})
-				idx2 := idx
-				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-					Index: &idx2,
-					Type:  "content_block_delta",
-					Delta: &dto.ClaudeMediaMessage{
-						Type:     "thinking_delta",
-						Thinking: &reasoning,
-					},
-				})
-				info.ClaudeConvertInfo.LastMessagesType = relaycommon.LastMessageTypeThinking
+				appendContentSegment(claudeContentSegment{kind: relaycommon.LastMessageTypeThinking, text: reasoning})
 			} else if content != "" {
-				if info.ClaudeConvertInfo.LastMessagesType != relaycommon.LastMessageTypeText {
-					stopOpenBlocksAndAdvance()
-				}
-				idx := info.ClaudeConvertInfo.Index
-				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-					Index: &idx,
-					Type:  "content_block_start",
-					ContentBlock: &dto.ClaudeMediaMessage{
-						Type: "text",
-						Text: common.GetPointer[string](""),
-					},
-				})
-				idx2 := idx
-				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-					Index: &idx2,
-					Type:  "content_block_delta",
-					Delta: &dto.ClaudeMediaMessage{
-						Type: "text_delta",
-						Text: common.GetPointer[string](content),
-					},
-				})
-				info.ClaudeConvertInfo.LastMessagesType = relaycommon.LastMessageTypeText
+				appendContentSegments(splitThinkTaggedStreamContent(content, info.ClaudeConvertInfo))
 			}
 		}
 
@@ -512,62 +885,20 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 							Input: map[string]interface{}{},
 						},
 					})
+					setToolCallName(blockIndex, toolCall.Function.Name)
 				}
 
-				if len(toolCall.Function.Arguments) > 0 {
-					claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-						Index: &idx,
-						Type:  "content_block_delta",
-						Delta: &dto.ClaudeMediaMessage{
-							Type:        "input_json_delta",
-							PartialJson: &toolCall.Function.Arguments,
-						},
-					})
-				}
+				appendToolCallArguments(blockIndex, toolCall.Function.Arguments)
 			}
 			info.ClaudeConvertInfo.ToolCallMaxIndexOffset = maxOffset
 			info.ClaudeConvertInfo.Index = base + maxOffset
 		} else {
 			reasoning := chosenChoice.Delta.GetReasoningContent()
 			textContent := chosenChoice.Delta.GetContentString()
-			if reasoning != "" || textContent != "" {
-				if reasoning != "" {
-					if info.ClaudeConvertInfo.LastMessagesType != relaycommon.LastMessageTypeThinking {
-						stopOpenBlocksAndAdvance()
-						idx := info.ClaudeConvertInfo.Index
-						claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-							Index: &idx,
-							Type:  "content_block_start",
-							ContentBlock: &dto.ClaudeMediaMessage{
-								Type:     "thinking",
-								Thinking: common.GetPointer[string](""),
-							},
-						})
-					}
-					info.ClaudeConvertInfo.LastMessagesType = relaycommon.LastMessageTypeThinking
-					claudeResponse.Delta = &dto.ClaudeMediaMessage{
-						Type:     "thinking_delta",
-						Thinking: &reasoning,
-					}
-				} else {
-					if info.ClaudeConvertInfo.LastMessagesType != relaycommon.LastMessageTypeText {
-						stopOpenBlocksAndAdvance()
-						idx := info.ClaudeConvertInfo.Index
-						claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-							Index: &idx,
-							Type:  "content_block_start",
-							ContentBlock: &dto.ClaudeMediaMessage{
-								Type: "text",
-								Text: common.GetPointer[string](""),
-							},
-						})
-					}
-					info.ClaudeConvertInfo.LastMessagesType = relaycommon.LastMessageTypeText
-					claudeResponse.Delta = &dto.ClaudeMediaMessage{
-						Type: "text_delta",
-						Text: common.GetPointer[string](textContent),
-					}
-				}
+			if reasoning != "" {
+				appendContentSegment(claudeContentSegment{kind: relaycommon.LastMessageTypeThinking, text: reasoning})
+			} else if textContent != "" {
+				appendContentSegments(splitThinkTaggedStreamContent(textContent, info.ClaudeConvertInfo))
 			} else {
 				isEmpty = true
 			}
@@ -621,19 +952,31 @@ func ResponseOpenAI2Claude(openAIResponse *dto.OpenAITextResponse, info *relayco
 				claudeContent.Type = "tool_use"
 				claudeContent.Id = toolUse.ID
 				claudeContent.Name = toolUse.Function.Name
+				arguments := sanitizeClaudeToolArguments(toolUse.Function.Arguments, toolUse.Function.Name, info)
 				var mapParams map[string]interface{}
-				if err := common.Unmarshal([]byte(toolUse.Function.Arguments), &mapParams); err == nil {
+				if err := common.Unmarshal([]byte(arguments), &mapParams); err == nil {
 					claudeContent.Input = mapParams
 				} else {
-					claudeContent.Input = toolUse.Function.Arguments
+					claudeContent.Input = arguments
 				}
 				contents = append(contents, claudeContent)
 			}
 		} else {
-			claudeContent := dto.ClaudeMediaMessage{}
-			claudeContent.Type = "text"
-			claudeContent.SetText(choice.Message.StringContent())
-			contents = append(contents, claudeContent)
+			if reasoning := choice.Message.GetReasoningContent(); reasoning != "" {
+				claudeContent := dto.ClaudeMediaMessage{Type: "thinking"}
+				claudeContent.Thinking = &reasoning
+				contents = append(contents, claudeContent)
+			}
+			for _, segment := range splitThinkTaggedContent(choice.Message.StringContent()) {
+				claudeContent := dto.ClaudeMediaMessage{Type: "text"}
+				if segment.kind == relaycommon.LastMessageTypeThinking {
+					claudeContent.Type = "thinking"
+					claudeContent.Thinking = &segment.text
+				} else {
+					claudeContent.SetText(segment.text)
+				}
+				contents = append(contents, claudeContent)
+			}
 		}
 	}
 	claudeResponse.Content = contents
@@ -648,7 +991,7 @@ func stopReasonOpenAI2Claude(reason string) string {
 }
 
 func toJSONString(v interface{}) string {
-	b, err := json.Marshal(v)
+	b, err := common.Marshal(v)
 	if err != nil {
 		return "{}"
 	}
@@ -870,7 +1213,7 @@ func ResponseOpenAI2Gemini(openAIResponse *dto.OpenAITextResponse, info *relayco
 				// 解析参数
 				var args map[string]interface{}
 				if toolCall.Function.Arguments != "" {
-					if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &args); err != nil {
+					if err := common.Unmarshal([]byte(toolCall.Function.Arguments), &args); err != nil {
 						args = map[string]interface{}{"arguments": toolCall.Function.Arguments}
 					}
 				} else {
@@ -973,7 +1316,7 @@ func StreamResponseOpenAI2Gemini(openAIResponse *dto.ChatCompletionsStreamRespon
 				// 解析参数
 				var args map[string]interface{}
 				if toolCall.Function.Arguments != "" {
-					if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &args); err != nil {
+					if err := common.Unmarshal([]byte(toolCall.Function.Arguments), &args); err != nil {
 						args = map[string]interface{}{"arguments": toolCall.Function.Arguments}
 					}
 				} else {

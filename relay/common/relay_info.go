@@ -39,9 +39,13 @@ type ClaudeConvertInfo struct {
 	Usage            *dto.Usage
 	FinishReason     string
 	Done             bool
+	ThinkTagBuffer   string
+	InThinkTag       bool
 
-	ToolCallBaseIndex      int
-	ToolCallMaxIndexOffset int
+	ToolCallBaseIndex       int
+	ToolCallMaxIndexOffset  int
+	ToolCallArgumentBuffers map[int]string
+	ToolCallNames           map[int]string
 }
 
 type RerankerInfo struct {

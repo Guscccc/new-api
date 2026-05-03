@@ -9,6 +9,10 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 	return openaicompat.ChatCompletionsRequestToResponsesRequest(req)
 }
 
+func SanitizeResponsesRequestCacheControl(request *dto.OpenAIResponsesRequest) error {
+	return openaicompat.SanitizeResponsesRequestCacheControl(request)
+}
+
 func ResponsesResponseToChatCompletionsResponse(resp *dto.OpenAIResponsesResponse, id string) (*dto.OpenAITextResponse, *dto.Usage, error) {
 	return openaicompat.ResponsesResponseToChatCompletionsResponse(resp, id)
 }

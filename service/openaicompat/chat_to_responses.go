@@ -73,6 +73,105 @@ func convertChatResponseFormatToResponsesText(reqFormat *dto.ResponseFormat) jso
 	return textRaw
 }
 
+func promptCacheRetentionValue(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var value string
+	if err := common.Unmarshal(raw, &value); err != nil {
+		return ""
+	}
+	return value
+}
+
+func mergePromptCacheRetention(current json.RawMessage, next json.RawMessage) json.RawMessage {
+	if len(next) == 0 || promptCacheRetentionValue(current) == "24h" {
+		return current
+	}
+	if promptCacheRetentionValue(next) == "24h" || len(current) == 0 {
+		return next
+	}
+	return current
+}
+
+func promptCacheRetentionFromCacheControl(cacheControl any) json.RawMessage {
+	if cacheControl == nil {
+		return nil
+	}
+	if value, ok := cacheControl.(map[string]any); ok && common.Interface2String(value["ttl"]) == "1h" {
+		return json.RawMessage(`"24h"`)
+	}
+	return json.RawMessage(`"in_memory"`)
+}
+
+func promptCacheRetentionFromRawCacheControl(cacheControl json.RawMessage) json.RawMessage {
+	if len(cacheControl) == 0 {
+		return nil
+	}
+	var parsed any
+	if err := common.Unmarshal(cacheControl, &parsed); err != nil {
+		return nil
+	}
+	return promptCacheRetentionFromCacheControl(parsed)
+}
+
+func stripResponsesInputCacheControl(value any) (any, json.RawMessage, bool) {
+	switch typed := value.(type) {
+	case []any:
+		var retention json.RawMessage
+		changed := false
+		for i, item := range typed {
+			stripped, itemRetention, itemChanged := stripResponsesInputCacheControl(item)
+			if itemChanged {
+				typed[i] = stripped
+				changed = true
+				retention = mergePromptCacheRetention(retention, itemRetention)
+			}
+		}
+		return typed, retention, changed
+	case map[string]any:
+		var retention json.RawMessage
+		changed := false
+		if cacheControl, ok := typed["cache_control"]; ok {
+			delete(typed, "cache_control")
+			changed = true
+			retention = mergePromptCacheRetention(retention, promptCacheRetentionFromCacheControl(cacheControl))
+		}
+		for key, item := range typed {
+			stripped, itemRetention, itemChanged := stripResponsesInputCacheControl(item)
+			if itemChanged {
+				typed[key] = stripped
+				changed = true
+				retention = mergePromptCacheRetention(retention, itemRetention)
+			}
+		}
+		return typed, retention, changed
+	default:
+		return value, nil, false
+	}
+}
+
+func SanitizeResponsesRequestCacheControl(request *dto.OpenAIResponsesRequest) error {
+	if request == nil || len(request.Input) == 0 {
+		return nil
+	}
+	var input any
+	if err := common.Unmarshal(request.Input, &input); err != nil {
+		return err
+	}
+	stripped, retention, changed := stripResponsesInputCacheControl(input)
+	if !changed {
+		return nil
+	}
+	inputRaw, err := common.Marshal(stripped)
+	if err != nil {
+		return err
+	}
+	request.Input = inputRaw
+	request.PromptCacheRetention = mergePromptCacheRetention(request.PromptCacheRetention, retention)
+	return nil
+}
+
 func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*dto.OpenAIResponsesRequest, error) {
 	if req == nil {
 		return nil, errors.New("request is nil")
@@ -85,6 +184,7 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 	}
 
 	var instructionsParts []string
+	var inputCacheRetention json.RawMessage
 	inputItems := make([]map[string]any, 0, len(req.Messages))
 
 	for _, msg := range req.Messages {
@@ -214,40 +314,43 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 		contentParts := make([]map[string]any, 0, len(parts))
 		for _, part := range parts {
 			switch part.Type {
-			case dto.ContentTypeText:
-				textType := "input_text"
-				if role == "assistant" {
-					textType = "output_text"
-				}
-				contentParts = append(contentParts, map[string]any{
-					"type": textType,
-					"text": part.Text,
-				})
-			case dto.ContentTypeImageURL:
-				contentParts = append(contentParts, map[string]any{
-					"type":      "input_image",
-					"image_url": normalizeChatImageURLToString(part.ImageUrl),
-				})
-			case dto.ContentTypeInputAudio:
-				contentParts = append(contentParts, map[string]any{
-					"type":        "input_audio",
-					"input_audio": part.InputAudio,
-				})
-			case dto.ContentTypeFile:
-				contentParts = append(contentParts, map[string]any{
-					"type": "input_file",
-					"file": part.File,
-				})
-			case dto.ContentTypeVideoUrl:
-				contentParts = append(contentParts, map[string]any{
-					"type":      "input_video",
-					"video_url": part.VideoUrl,
-				})
-			default:
-				contentParts = append(contentParts, map[string]any{
-					"type": part.Type,
-				})
+		case dto.ContentTypeText:
+			textType := "input_text"
+			if role == "assistant" {
+				textType = "output_text"
 			}
+			contentParts = append(contentParts, map[string]any{
+				"type": textType,
+				"text": part.Text,
+			})
+			if len(part.CacheControl) > 0 {
+				inputCacheRetention = mergePromptCacheRetention(inputCacheRetention, promptCacheRetentionFromRawCacheControl(part.CacheControl))
+			}
+		case dto.ContentTypeImageURL:
+			contentParts = append(contentParts, map[string]any{
+				"type":      "input_image",
+				"image_url": normalizeChatImageURLToString(part.ImageUrl),
+			})
+		case dto.ContentTypeInputAudio:
+			contentParts = append(contentParts, map[string]any{
+				"type":        "input_audio",
+				"input_audio": part.InputAudio,
+			})
+		case dto.ContentTypeFile:
+			contentParts = append(contentParts, map[string]any{
+				"type": "input_file",
+				"file": part.File,
+			})
+		case dto.ContentTypeVideoUrl:
+			contentParts = append(contentParts, map[string]any{
+				"type":      "input_video",
+				"video_url": part.VideoUrl,
+			})
+		default:
+			contentParts = append(contentParts, map[string]any{
+				"type": part.Type,
+			})
+		}
 		}
 		item["content"] = contentParts
 		inputItems = append(inputItems, item)
@@ -357,6 +460,11 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 
 	textRaw := convertChatResponseFormatToResponsesText(req.ResponseFormat)
 
+	var promptCacheKeyRaw json.RawMessage
+	if req.PromptCacheKey != "" {
+		promptCacheKeyRaw, _ = common.Marshal(req.PromptCacheKey)
+	}
+
 	maxOutputTokens := lo.FromPtrOr(req.MaxTokens, uint(0))
 	maxCompletionTokens := lo.FromPtrOr(req.MaxCompletionTokens, uint(0))
 	if maxCompletionTokens > maxOutputTokens {
@@ -373,20 +481,26 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 	}
 
 	out := &dto.OpenAIResponsesRequest{
-		Model:             req.Model,
-		Input:             inputRaw,
-		Instructions:      instructionsRaw,
-		Stream:            req.Stream,
-		Temperature:       req.Temperature,
-		Text:              textRaw,
-		ToolChoice:        toolChoiceRaw,
-		Tools:             toolsRaw,
-		TopP:              topP,
-		User:              req.User,
-		ParallelToolCalls: parallelToolCallsRaw,
-		Store:             req.Store,
-		Metadata:          req.Metadata,
+		Model:                req.Model,
+		Input:                inputRaw,
+		Instructions:         instructionsRaw,
+		Stream:               req.Stream,
+		Temperature:          req.Temperature,
+		Text:                 textRaw,
+		ToolChoice:           toolChoiceRaw,
+		Tools:                toolsRaw,
+		TopP:                 topP,
+		User:                 req.User,
+		ParallelToolCalls:    parallelToolCallsRaw,
+		Store:                req.Store,
+		Metadata:             req.Metadata,
+		PromptCacheKey:       promptCacheKeyRaw,
+		PromptCacheRetention: mergePromptCacheRetention(req.PromptCacheRetention, inputCacheRetention),
 	}
+	if err := SanitizeResponsesRequestCacheControl(out); err != nil {
+		return nil, err
+	}
+
 	if req.MaxTokens != nil || req.MaxCompletionTokens != nil {
 		out.MaxOutputTokens = lo.ToPtr(maxOutputTokens)
 	}
