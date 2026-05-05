@@ -48,6 +48,8 @@ func responsesToolCallArgsFromSnapshot(prev string, snapshot string) (string, st
 			return snapshot, snapshot[len(prev):]
 		case strings.HasPrefix(prev, snapshot):
 			return prev, ""
+		default:
+			return snapshot, ""
 		}
 	}
 	return snapshot, snapshot
@@ -436,6 +438,9 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			newArgs := streamResp.Item.ArgumentsString()
 			prevArgs := toolCallArgsByID[callID]
 			nextArgs, argsDelta := responsesToolCallArgsFromSnapshot(prevArgs, newArgs)
+			if argsDelta == "" && prevArgs != "" && newArgs != "" && nextArgs == newArgs && info.RelayFormat == types.RelayFormatClaude {
+				argsDelta = newArgs
+			}
 			toolCallArgsByID[callID] = nextArgs
 
 			if !sendToolCallDelta(callID, name, argsDelta) {

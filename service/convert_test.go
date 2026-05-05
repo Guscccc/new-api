@@ -299,6 +299,42 @@ func TestStreamResponseOpenAI2ClaudeHandlesCumulativeToolArgumentSnapshots(t *te
 	require.JSONEq(t, `{"file_path":"notes.md","offset":100,"limit":5}`, partialJSON)
 }
 
+func TestMergeToolCallArgumentBufferHandlesFullSnapshotReplacement(t *testing.T) {
+	current := `{"file_path":"notes.md","offset":1000,"limit":5}`
+	incoming := `{"file_path":"notes.md","offset":100,"limit":5}`
+
+	merged := mergeToolCallArgumentBuffer(current, incoming)
+
+	require.JSONEq(t, incoming, merged)
+}
+
+func TestMergeToolCallArgumentBufferIgnoresOlderShorterSnapshot(t *testing.T) {
+	current := `{"file_path":"notes.md","offset":100,"limit":5}`
+	incoming := `{"file_path":"notes.md","offset":100}`
+
+	merged := mergeToolCallArgumentBuffer(current, incoming)
+
+	require.JSONEq(t, current, merged)
+}
+
+func TestMergeToolCallArgumentBufferAppendsTrueDelta(t *testing.T) {
+	current := `{"file_path":"notes.md","offset":10`
+	incoming := `0,"limit":5}`
+
+	merged := mergeToolCallArgumentBuffer(current, incoming)
+
+	require.JSONEq(t, `{"file_path":"notes.md","offset":100,"limit":5}`, merged)
+}
+
+func TestMergeToolCallArgumentBufferAppendsNestedObjectDelta(t *testing.T) {
+	current := `{"outer":`
+	incoming := `{"inner":1}}`
+
+	merged := mergeToolCallArgumentBuffer(current, incoming)
+
+	require.JSONEq(t, `{"outer":{"inner":1}}`, merged)
+}
+
 func TestResponseOpenAI2ClaudeSanitizesEmptyOptionalToolArgs(t *testing.T) {
 	info := &relaycommon.RelayInfo{}
 	openAIResponse := &dto.OpenAITextResponse{

@@ -35,6 +35,86 @@ func appendClaudeContentSegment(segments *[]claudeContentSegment, kind string, t
 	*segments = append(*segments, claudeContentSegment{kind: kind, text: text})
 }
 
+func firstJSONObjectKey(text string) (string, bool) {
+	text = strings.TrimLeft(text, " \t\r\n")
+	if !strings.HasPrefix(text, "{") {
+		return "", false
+	}
+	text = strings.TrimLeft(text[1:], " \t\r\n")
+	if !strings.HasPrefix(text, "\"") {
+		return "", false
+	}
+	for i := 1; i < len(text); i++ {
+		if text[i] == '\\' {
+			i++
+			continue
+		}
+		if text[i] == '"' {
+			var key string
+			if err := common.Unmarshal([]byte(text[:i+1]), &key); err != nil {
+				return "", false
+			}
+			return key, true
+		}
+	}
+	return "", false
+}
+
+func isCompleteJSONValue(text string) bool {
+	var value any
+	return common.Unmarshal([]byte(text), &value) == nil
+}
+
+func jsonObjectKeyCount(text string) (int, bool) {
+	var value map[string]any
+	if err := common.Unmarshal([]byte(text), &value); err != nil {
+		return 0, false
+	}
+	return len(value), true
+}
+
+func shouldKeepCurrentToolArgumentSnapshot(current string, incoming string) bool {
+	currentKeys, currentOK := jsonObjectKeyCount(current)
+	incomingKeys, incomingOK := jsonObjectKeyCount(incoming)
+	return currentOK && incomingOK && incomingKeys < currentKeys
+}
+
+func isLikelyCumulativeToolArguments(current string, incoming string) bool {
+	current = strings.TrimLeft(current, " \t\r\n")
+	incoming = strings.TrimLeft(incoming, " \t\r\n")
+	if incoming == "" || (!strings.HasPrefix(incoming, "{") && !strings.HasPrefix(incoming, "[")) {
+		return false
+	}
+	if isCompleteJSONValue(current) && isCompleteJSONValue(incoming) {
+		return true
+	}
+	currentKey, currentOK := firstJSONObjectKey(current)
+	incomingKey, incomingOK := firstJSONObjectKey(incoming)
+	return currentOK && incomingOK && currentKey == incomingKey
+}
+
+func mergeToolCallArgumentBuffer(current string, incoming string) string {
+	if incoming == "" {
+		return current
+	}
+	if current == "" {
+		return incoming
+	}
+	if strings.HasPrefix(incoming, current) {
+		return incoming
+	}
+	if strings.HasPrefix(current, incoming) {
+		return current
+	}
+	if isLikelyCumulativeToolArguments(current, incoming) {
+		if shouldKeepCurrentToolArgumentSnapshot(current, incoming) {
+			return current
+		}
+		return incoming
+	}
+	return current + incoming
+}
+
 func splitThinkTaggedContent(content string) []claudeContentSegment {
 	if content == "" {
 		return nil
@@ -613,13 +693,11 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 		}
 		ensureToolCallBuffers()
 		current := info.ClaudeConvertInfo.ToolCallArgumentBuffers[blockIndex]
-		if current != "" && strings.HasPrefix(arguments, current) {
-			arguments = arguments[len(current):]
-		}
-		if arguments == "" {
+		merged := mergeToolCallArgumentBuffer(current, arguments)
+		if merged == current {
 			return
 		}
-		info.ClaudeConvertInfo.ToolCallArgumentBuffers[blockIndex] = current + arguments
+		info.ClaudeConvertInfo.ToolCallArgumentBuffers[blockIndex] = merged
 	}
 	flushToolCallArguments := func() {
 		if len(info.ClaudeConvertInfo.ToolCallArgumentBuffers) == 0 {
