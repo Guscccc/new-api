@@ -612,7 +612,14 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 			return
 		}
 		ensureToolCallBuffers()
-		info.ClaudeConvertInfo.ToolCallArgumentBuffers[blockIndex] += arguments
+		current := info.ClaudeConvertInfo.ToolCallArgumentBuffers[blockIndex]
+		if current != "" && strings.HasPrefix(arguments, current) {
+			arguments = arguments[len(current):]
+		}
+		if arguments == "" {
+			return
+		}
+		info.ClaudeConvertInfo.ToolCallArgumentBuffers[blockIndex] = current + arguments
 	}
 	flushToolCallArguments := func() {
 		if len(info.ClaudeConvertInfo.ToolCallArgumentBuffers) == 0 {

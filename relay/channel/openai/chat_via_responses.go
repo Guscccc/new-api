@@ -38,6 +38,31 @@ func stringDeltaFromPrefix(prev string, next string) string {
 	return next
 }
 
+func responsesToolCallArgsFromSnapshot(prev string, snapshot string) (string, string) {
+	if snapshot == "" {
+		return prev, ""
+	}
+	if prev != "" {
+		switch {
+		case strings.HasPrefix(snapshot, prev):
+			return snapshot, snapshot[len(prev):]
+		case strings.HasPrefix(prev, snapshot):
+			return prev, ""
+		}
+	}
+	return snapshot, snapshot
+}
+
+func responsesToolCallArgsFromDelta(prev string, delta string) (string, string) {
+	if delta == "" {
+		return prev, ""
+	}
+	if prev != "" && strings.HasPrefix(delta, prev) {
+		return delta, delta[len(prev):]
+	}
+	return prev + delta, delta
+}
+
 func OaiResponsesToChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	if resp == nil || resp.Body == nil {
 		return nil, types.NewOpenAIError(fmt.Errorf("invalid response"), types.ErrorCodeBadResponse, http.StatusInternalServerError)
@@ -410,15 +435,8 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 
 			newArgs := streamResp.Item.ArgumentsString()
 			prevArgs := toolCallArgsByID[callID]
-			argsDelta := ""
-			if newArgs != "" {
-				if strings.HasPrefix(newArgs, prevArgs) {
-					argsDelta = newArgs[len(prevArgs):]
-				} else {
-					argsDelta = newArgs
-				}
-				toolCallArgsByID[callID] = newArgs
-			}
+			nextArgs, argsDelta := responsesToolCallArgsFromSnapshot(prevArgs, newArgs)
+			toolCallArgsByID[callID] = nextArgs
 
 			if !sendToolCallDelta(callID, name, argsDelta) {
 				sr.Stop(streamErr)
@@ -434,8 +452,10 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			if callID == "" {
 				break
 			}
-			toolCallArgsByID[callID] += streamResp.Delta
-			if !sendToolCallDelta(callID, "", streamResp.Delta) {
+			prevArgs := toolCallArgsByID[callID]
+			nextArgs, argsDelta := responsesToolCallArgsFromDelta(prevArgs, streamResp.Delta)
+			toolCallArgsByID[callID] = nextArgs
+			if !sendToolCallDelta(callID, "", argsDelta) {
 				sr.Stop(streamErr)
 				return
 			}

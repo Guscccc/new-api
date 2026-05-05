@@ -245,6 +245,60 @@ func TestStreamResponseOpenAI2ClaudeSanitizesEmptyOptionalToolArgs(t *testing.T)
 	require.JSONEq(t, `{"file_path":"notes.md"}`, partialJSON)
 }
 
+func TestStreamResponseOpenAI2ClaudeHandlesCumulativeToolArgumentSnapshots(t *testing.T) {
+	info := newClaudeConvertTestInfo()
+	finishReason := "tool_calls"
+	toolIndex := 0
+	chunks := []string{
+		`{"file_path":"notes.md","offset":1`,
+		`{"file_path":"notes.md","offset":10`,
+		`{"file_path":"notes.md","offset":100,"limit":5}`,
+	}
+
+	var claudeResponses []*dto.ClaudeResponse
+	for i, arguments := range chunks {
+		if i > 0 {
+			info.SendResponseCount++
+		}
+		toolCall := dto.ToolCallResponse{
+			Index: &toolIndex,
+			ID:    "call_1",
+			Function: dto.FunctionResponse{
+				Arguments: arguments,
+			},
+		}
+		if i == 0 {
+			toolCall.Function.Name = "Read"
+		}
+		var chunkFinishReason *string
+		var usage *dto.Usage
+		if i == len(chunks)-1 {
+			chunkFinishReason = &finishReason
+			usage = &dto.Usage{}
+		}
+		streamResponse := &dto.ChatCompletionsStreamResponse{
+			Id:    "chatcmpl-1",
+			Model: "claude-3-5-sonnet",
+			Choices: []dto.ChatCompletionsStreamResponseChoice{{
+				Delta: dto.ChatCompletionsStreamResponseChoiceDelta{
+					ToolCalls: []dto.ToolCallResponse{toolCall},
+				},
+				FinishReason: chunkFinishReason,
+			}},
+			Usage: usage,
+		}
+		claudeResponses = append(claudeResponses, StreamResponseOpenAI2Claude(streamResponse, info)...)
+	}
+
+	var partialJSON string
+	for _, response := range claudeResponses {
+		if response.Delta != nil && response.Delta.Type == "input_json_delta" {
+			partialJSON += *response.Delta.PartialJson
+		}
+	}
+	require.JSONEq(t, `{"file_path":"notes.md","offset":100,"limit":5}`, partialJSON)
+}
+
 func TestResponseOpenAI2ClaudeSanitizesEmptyOptionalToolArgs(t *testing.T) {
 	info := &relaycommon.RelayInfo{}
 	openAIResponse := &dto.OpenAITextResponse{
